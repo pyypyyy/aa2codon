@@ -1,7 +1,11 @@
 # aa2codon
 
-You can run aa2codon_optimize.ipynb directly in google colab.
-You can also run the Codon_optimizer_train.ipynb directly in colab.
+You can run the tool from <a href="https://github.com/pyypyyy/aa2codon/blob/main/aa2codon_optimize.ipynb">here</a> directly in google colab.
+
+
+You can also try training your own models from <a href="https://github.com/pyypyyy/aa2codon/blob/main/Codon_optimizer_train.ipynb">here</a>.
+
+
 
 *********************************************************************
 
