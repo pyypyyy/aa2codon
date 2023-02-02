@@ -1,6 +1,7 @@
 # aa2codon
 
-You can run aa2codon_optimize.ipynb in google colab.
+You can run aa2codon_optimize.ipynb directly in google colab.
+You can also run the Codon_optimizer_train.ipynb directly in colab.
 
 *********************************************************************
 
@@ -20,4 +21,6 @@ The model is trained by giving it amino acid sequences translated from genes, wh
 
 The model metrics are stored here: https://tensorboard.dev/experiment/g4WHVqsBRfGPYnWNuesL1g/#scalars
 
-I will provide the model and the script for parsing and vectorizing genomic data soon.
+2.2.2023
+
+Added the Codon_optimizer_train.ipynb for training models.
