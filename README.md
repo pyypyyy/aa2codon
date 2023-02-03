@@ -21,7 +21,7 @@ The accuracy of the model at the validation data set is 59.61% and at the protei
 
 The model exceeds the validation accuracy of previously reported models (52%, Fu et al. 2020; https://doi.org/10.1038/s41598-020-74091-z). Previous models were based on LSTM neural networks, which are outdated by now.
 
-The model is trained by giving it amino acid sequences translated from genes, which it translates back into codons. The model has been trained with 12927 E. coli gene fragments with a maximum length of 450bp. The fragments were digested from 4242 genes. 10% of the sequences have been used for validation and the remaining 90% for training. The code for searching and editing genes for the exercise will be provided when I get it cleaned up.
+The model is trained by giving it amino acid sequences translated from genes, which it translates back into codons. The model has been trained with 12927 E. coli gene fragments with a maximum length of 450bp. The fragments were digested from 4242 genes. 10% of the sequences have been used for validation and the remaining 90% for training. The code for searching and editing genes for training is available.
 
 The model metrics are stored here: https://tensorboard.dev/experiment/g4WHVqsBRfGPYnWNuesL1g/#scalars
 
