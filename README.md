@@ -10,7 +10,7 @@ You can also try training your own models from <a href="https://github.com/pyypy
 *********************************************************************
 
 
-Optimisation tool based on transformers
+# Deep learning Optimisation tool based on transformers
 
 
 This transformer-based tool is based on the work of Vaswani et al. al.: https://arxiv.org/abs/1706.03762
