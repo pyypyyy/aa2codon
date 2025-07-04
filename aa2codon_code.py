@@ -29,114 +29,6 @@ from Bio import SeqIO
 import pandas as pd
 import plotly.express as px
 
-
-#@title Click the arrow and provide a sequence such as "atgtttccc" to the prompt. Max lenght is 150 codons --> 450 bp { display-mode: "form" }
-
-
-
-seq = input("Provide a sequence: Example of a calid sequence: 'atgctattttag' (without quotes): ")
-# Example sequence:   atggaaattgtgctgacccaatctccgggcacactgagcttgtctccgggcgaacgtgcgacccttagctgcagagccagccagtcggtgtccagctcgtaccttaattggacctaccttacttggtatcaacagaaaccaggtcaagcacctcgcctgctgatttatggcgcctcttcacgtgccactggggtcccggatcgctttagcggctctggcagtggcaccgattttactctgaccatttcccgtctgaaaccggaagacttcgcggtgtactattgtcagcagtacaactccgtccctcttacctttggccaggggacgaaagtcgagattaaacgg
-
-
-# Inference
-aa_seq, codon_seq = pair_provider(seq)
-prediction, tokens, attention_weights = reloaded(aa_seq)
-predicted_codons = decode_codons(prediction)
-predicted_aas = [str(Seq(x).translate()) for x in predicted_codons[1:-1]]
-predicted_aas.insert(0, "[START]")
-predicted_aas.append("[END]")
-
-# This function shows the results of the translation
-def show_results(seq1, seq2):
-  seq1, seq2 = seq1[1:-1], seq2[1:-1] #remove [START] [STOP] to simplify alignment
-  match = "|" * len(seq1[1])
-  miss = "X" * len(seq1[1])
-  alignment = [match if x == y else miss for x, y in zip(seq1, seq2)]
-  misses = alignment.count(miss)
-  similarity = round((1 - misses / len(alignment)) * 100, 2)
-  print("")
-  print(f'{"CODON ALIGNMENT" if len(match) == 3 else "AMINO ACID ALIGNMENT"}')
-  print("#################################################################################################################")
-  print(f'{"STARTING SEQUENCE" :25s}: {"".join(seq1[:-1]) if len(match) == 3 else "".join(seq2[:-1])} ')
-  print("-----------------------------------------------------------------------------------------------------------------")
-  print(f'{"Starting seq" :25s}: {" ".join(seq1)}, {len(seq1)}')
-  print(f'{"Alignment" :25s}: {" ".join(alignment)}')
-  print(f'{"Predicted seq" :25s}: {" ".join(seq2)}, {len(seq2)}')
-  print(f'{"Stats" :25s}: Altered {"codons" if len(match) == 3 else "amino acids"}: {misses}, similarity {similarity} %')
-  print("-----------------------------------------------------------------------------------------------------------------")
-  print(f'{"RESULT" :25s}: {"".join(seq2[:-1])}')
-  
-  
-  
-def show_CAI(seq, ref_path="aa2codon/ecol.heg.fasta"):
-  # codon adaptation index
-  lst = []
-  for record in SeqIO.parse(ref_path, "fasta"):
-      lst.append(record.seq)
-  return(CAI(seq, reference=lst))
-
-cai1 = show_CAI(seq)
-cai2 = show_CAI("".join(predicted_codons[1:-1]))
-
-
-show_results(codon_seq.split(" "), predicted_codons)
-show_results(aa_seq.split(" "), predicted_aas)
-print(f"STARTING SEQUENCE CAI: {round(cai1, 2) * 100}")
-
-print(f"OPTIMIZED SEQUENCE CAI: {round(cai2, 2) * 100}")
-
-#plot_attention_weights(seq,
-#                       tokens,
-#                       attention_weights[0])
-
-
-
-# visualization of sequence data
-
-
-# Create a list with the order of the sequences for plotting
-
-def makeordered(lista):
-  lst = []
-  n = 1
-  for i in lista:
-    if i == "[START]":
-      n = n - 1
-    lst.append(f"{(i, n)}")
-    n = n + 1
-  return lst
-
-# Plot the attention weights for a specific attention head
-
-def plot_heads(seq, tokens, attention):
-  tokens = tokens
-  seq = aa2id(seq)
-  df = pd.DataFrame(np.array(attention))
-  df.columns =  makeordered([label for label in decode_aas(seq.numpy())])
-  df.index = makeordered([label for label in decode_codons(tokens[1:].numpy())])
-  return df
-
-
-# Plot the attention weights for all attention heads
-
-def plot_headsit(attention_weights):
-  img_seq = []
-  for i in attention_weights:
-    img_seq.append(plot_heads(aa_seq, tokens, i))
-  return img_seq
-
-# Plot the attention weights with Plotly
-
-def plotter(plot_lst):
-  n = 1
-  for i in plot_lst:
-    plot = px.imshow(i,
-                     color_continuous_scale=px.colors.sequential.Viridis,
-                     title=f"Attention Head {n}")
-    plot.show()
-    n = n + 1
-lst = plot_headsit(attention_weights[0])
-plotter(lst)
 import pickle
 
 from CAI import CAI
@@ -267,3 +159,111 @@ def pair_provider(seq):
   elif seq_check(seq) == "aa":
     return "[START] " + " ".join(list(seq.upper())) + " [END]", "N/A"
   return "[START] " + str(aa) + " [END]", "[START] " + str(seq).upper() + " [END]"
+
+#@title Click the arrow and provide a sequence such as "atgtttccc" to the prompt. Max lenght is 150 codons --> 450 bp { display-mode: "form" }
+
+
+
+seq = input("Provide a sequence: Example of a calid sequence: 'atgctattttag' (without quotes): ")
+# Example sequence:   atggaaattgtgctgacccaatctccgggcacactgagcttgtctccgggcgaacgtgcgacccttagctgcagagccagccagtcggtgtccagctcgtaccttaattggacctaccttacttggtatcaacagaaaccaggtcaagcacctcgcctgctgatttatggcgcctcttcacgtgccactggggtcccggatcgctttagcggctctggcagtggcaccgattttactctgaccatttcccgtctgaaaccggaagacttcgcggtgtactattgtcagcagtacaactccgtccctcttacctttggccaggggacgaaagtcgagattaaacgg
+
+
+# Inference
+aa_seq, codon_seq = pair_provider(seq)
+prediction, tokens, attention_weights = reloaded(aa_seq)
+predicted_codons = decode_codons(prediction)
+predicted_aas = [str(Seq(x).translate()) for x in predicted_codons[1:-1]]
+predicted_aas.insert(0, "[START]")
+predicted_aas.append("[END]")
+
+# This function shows the results of the translation
+def show_results(seq1, seq2):
+  seq1, seq2 = seq1[1:-1], seq2[1:-1] #remove [START] [STOP] to simplify alignment
+  match = "|" * len(seq1[1])
+  miss = "X" * len(seq1[1])
+  alignment = [match if x == y else miss for x, y in zip(seq1, seq2)]
+  misses = alignment.count(miss)
+  similarity = round((1 - misses / len(alignment)) * 100, 2)
+  print("")
+  print(f'{"CODON ALIGNMENT" if len(match) == 3 else "AMINO ACID ALIGNMENT"}')
+  print("#################################################################################################################")
+  print(f'{"STARTING SEQUENCE" :25s}: {"".join(seq1[:-1]) if len(match) == 3 else "".join(seq2[:-1])} ')
+  print("-----------------------------------------------------------------------------------------------------------------")
+  print(f'{"Starting seq" :25s}: {" ".join(seq1)}, {len(seq1)}')
+  print(f'{"Alignment" :25s}: {" ".join(alignment)}')
+  print(f'{"Predicted seq" :25s}: {" ".join(seq2)}, {len(seq2)}')
+  print(f'{"Stats" :25s}: Altered {"codons" if len(match) == 3 else "amino acids"}: {misses}, similarity {similarity} %')
+  print("-----------------------------------------------------------------------------------------------------------------")
+  print(f'{"RESULT" :25s}: {"".join(seq2[:-1])}')
+  
+  
+  
+def show_CAI(seq, ref_path="aa2codon/ecol.heg.fasta"):
+  # codon adaptation index
+  lst = []
+  for record in SeqIO.parse(ref_path, "fasta"):
+      lst.append(record.seq)
+  return(CAI(seq, reference=lst))
+
+cai1 = show_CAI(seq)
+cai2 = show_CAI("".join(predicted_codons[1:-1]))
+
+
+show_results(codon_seq.split(" "), predicted_codons)
+show_results(aa_seq.split(" "), predicted_aas)
+print(f"STARTING SEQUENCE CAI: {round(cai1, 2) * 100}")
+
+print(f"OPTIMIZED SEQUENCE CAI: {round(cai2, 2) * 100}")
+
+#plot_attention_weights(seq,
+#                       tokens,
+#                       attention_weights[0])
+
+
+
+# visualization of sequence data
+
+
+# Create a list with the order of the sequences for plotting
+
+def makeordered(lista):
+  lst = []
+  n = 1
+  for i in lista:
+    if i == "[START]":
+      n = n - 1
+    lst.append(f"{(i, n)}")
+    n = n + 1
+  return lst
+
+# Plot the attention weights for a specific attention head
+
+def plot_heads(seq, tokens, attention):
+  tokens = tokens
+  seq = aa2id(seq)
+  df = pd.DataFrame(np.array(attention))
+  df.columns =  makeordered([label for label in decode_aas(seq.numpy())])
+  df.index = makeordered([label for label in decode_codons(tokens[1:].numpy())])
+  return df
+
+
+# Plot the attention weights for all attention heads
+
+def plot_headsit(attention_weights):
+  img_seq = []
+  for i in attention_weights:
+    img_seq.append(plot_heads(aa_seq, tokens, i))
+  return img_seq
+
+# Plot the attention weights with Plotly
+
+def plotter(plot_lst):
+  n = 1
+  for i in plot_lst:
+    plot = px.imshow(i,
+                     color_continuous_scale=px.colors.sequential.Viridis,
+                     title=f"Attention Head {n}")
+    plot.show()
+    n = n + 1
+lst = plot_headsit(attention_weights[0])
+plotter(lst)
