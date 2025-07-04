@@ -143,17 +143,13 @@ from CAI import CAI
 
 ## Stored vectorize layers
 from_disk = pickle.load(open("/content/aa2codon/aa2id.pkl", "rb"))
-config = from_disk['config']
-config.pop('batch_input_shape', None)
-aa2id = tf.keras.layers.TextVectorization.from_config(config)
+aa2id = tf.keras.layers.TextVectorization.from_config(from_disk['config'])
 
 aa2id.adapt(tf.data.Dataset.from_tensor_slices(["xyz"]))
 aa2id.set_weights(from_disk['weights'])
 
 from_disk = pickle.load(open("/content/aa2codon/codon2id.pkl", "rb"))
-config = from_disk['config']
-config.pop('batch_input_shape', None)
-codon2id = tf.keras.layers.TextVectorization.from_config(config)
+codon2id = tf.keras.layers.TextVectorization.from_config(from_disk['config'])
 
 codon2id.adapt(tf.data.Dataset.from_tensor_slices(["xyz"]))
 codon2id.set_weights(from_disk['weights'])
