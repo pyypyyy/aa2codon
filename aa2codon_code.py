@@ -31,6 +31,14 @@ import plotly.express as px
 
 import pickle
 
+gpus = tf.config.list_physical_devices("GPU")
+if gpus:
+  tf.config.experimental.enable_tensor_float_32_execution(True)
+  tf.config.optimizer.set_jit(True)
+  tf.keras.mixed_precision.set_global_policy("mixed_float16")
+  for gpu in gpus:
+    tf.config.experimental.set_memory_growth(gpu, True)
+
 from CAI import CAI
 
 ## Stored vectorize layers
@@ -76,6 +84,7 @@ print("Loading the trained model...")
 reloaded = tf.saved_model.load(f'{sijainti}')
 # Print a message to indicate that the model is being loaded
 print("Ladattu:" , reloaded)
+infer = tf.function(reloaded.__call__)
 
 # Inference
 
@@ -178,7 +187,7 @@ seq = input("Provide a sequence: Example of a calid sequence: 'atgctattttag' (wi
 
 # Inference
 aa_seq, codon_seq = pair_provider(seq)
-prediction, tokens, attention_weights = reloaded(aa_seq)
+prediction, tokens, attention_weights = infer(aa_seq)
 predicted_codons = decode_codons(prediction)
 predicted_aas = [str(Seq(x).translate()) for x in predicted_codons[1:-1]]
 predicted_aas.insert(0, "[START]")
