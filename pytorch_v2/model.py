@@ -56,14 +56,15 @@ class XIELU(nn.Module):
 
 @dataclass
 class Config:
-    d_model: int = 128
+    d_model: int = 256
     heads: int = 8
     layers: int = 3
-    d_ff: int = 256
-    dropout: float = .1
+    d_ff: int = 1024
+    dropout: float = .05
     max_length: int = 1024
     activation: str = "xielu"
     synonym_mask: bool = True
+    architecture_version: int = 3
 
 class FFN(nn.Module):
     def __init__(self,c):
@@ -80,62 +81,123 @@ class FFN(nn.Module):
         z=z*F.silu(self.gate(x)) if self.gate is not None else self.act(z)
         return self.drop(self.down(z))
 
+class Rotary(nn.Module):
+    """Cached RoPE; query positions can be offset for aligned cross-attention."""
+    def __init__(self,head_dim,max_length):
+        super().__init__()
+        if head_dim%2: raise ValueError("RoPE requires even head dimension")
+        phase=torch.outer(torch.arange(max_length+2,dtype=torch.float32),
+            torch.exp(-math.log(10000)*torch.arange(0,head_dim,2,dtype=torch.float32)/head_dim))
+        self.register_buffer("cos",phase.cos(),persistent=False)
+        self.register_buffer("sin",phase.sin(),persistent=False)
+    def forward(self,x,offset=0):
+        c=self.cos[offset:offset+x.shape[-2]].to(x.dtype)
+        s=self.sin[offset:offset+x.shape[-2]].to(x.dtype)
+        a,b=x[...,::2],x[...,1::2]
+        return torch.stack((a*c-b*s,a*s+b*c),dim=-1).flatten(-2)
+
+class Attention(nn.Module):
+    """QK-RMSNorm, rotary positions, SDPA and query-dependent head gates."""
+    def __init__(self,c,cross=False):
+        super().__init__()
+        self.heads=c.heads
+        self.dim=c.d_model//c.heads
+        self.cross=cross
+        self.dropout=c.dropout
+        self.q=nn.Linear(c.d_model,c.d_model,bias=False)
+        self.k=nn.Linear(c.d_model,c.d_model,bias=False)
+        self.v=nn.Linear(c.d_model,c.d_model,bias=False)
+        self.out=nn.Linear(c.d_model,c.d_model,bias=False)
+        self.qnorm=nn.RMSNorm(self.dim,eps=1e-6)
+        self.knorm=nn.RMSNorm(self.dim,eps=1e-6)
+        self.rope=Rotary(self.dim,c.max_length)
+        self.gate=nn.Linear(c.d_model,c.heads)
+        nn.init.zeros_(self.gate.weight)
+        nn.init.constant_(self.gate.bias,1.)
+    def heads_view(self,x):
+        return x.reshape(x.shape[0],x.shape[1],self.heads,self.dim).transpose(1,2)
+    def forward(self,x,context,pad,causal=False,attention=False):
+        q=self.rope(self.qnorm(self.heads_view(self.q(x))),int(self.cross))
+        k=self.rope(self.knorm(self.heads_view(self.k(context))))
+        v=self.heads_view(self.v(context))
+        # SDPA bool masks use True for allowed keys, unlike MultiheadAttention.
+        mask=~pad[:,None,None,:]
+        if causal:
+            mask=mask & torch.ones(q.shape[-2],k.shape[-2],dtype=torch.bool,device=q.device).tril()
+        if attention:
+            # Explicit scores are needed only by the existing analysis interface.
+            weights=(q.float() @ k.float().transpose(-1,-2) / math.sqrt(self.dim))
+            weights=weights.masked_fill(~mask,float("-inf")).softmax(-1)
+            out=F.dropout(weights,p=self.dropout,training=self.training).to(v.dtype) @ v
+        else:
+            weights=None
+            out=F.scaled_dot_product_attention(q,k,v,attn_mask=mask,
+                    dropout_p=self.dropout if self.training else 0.)
+        gate=self.gate(x).sigmoid().transpose(1,2).unsqueeze(-1).to(out.dtype)
+        out=(out*gate).transpose(1,2).reshape(x.shape[0],x.shape[1],-1)
+        return self.out(out),weights
+
 class Block(nn.Module):
     def __init__(self,c,decoder=False):
         super().__init__()
-        self.self_attn=nn.MultiheadAttention(c.d_model,c.heads,dropout=c.dropout,batch_first=True)
-        self.cross=nn.MultiheadAttention(c.d_model,c.heads,dropout=c.dropout,batch_first=True) if decoder else None
-        self.n1=nn.LayerNorm(c.d_model)
-        self.n2=nn.LayerNorm(c.d_model)
-        self.n3=nn.LayerNorm(c.d_model) if decoder else None
+        self.self_attn=Attention(c)
+        self.cross=Attention(c,cross=True) if decoder else None
+        self.n1=nn.RMSNorm(c.d_model,eps=1e-6)
+        self.n2=nn.RMSNorm(c.d_model,eps=1e-6)
+        self.n3=nn.RMSNorm(c.d_model,eps=1e-6) if decoder else None
         self.ff=FFN(c)
         self.drop=nn.Dropout(c.dropout)
-    def forward(self,x,pad,context=None,context_pad=None,causal=None,attention=False):
-        out,_=self.self_attn(x,x,x,key_padding_mask=pad,attn_mask=causal,need_weights=False)
-        x=self.n1(x+self.drop(out))
+    def forward(self,x,pad,context=None,context_pad=None,causal=False,attention=False):
+        z=self.n1(x)
+        out,_=self.self_attn(z,z,pad,causal=causal)
+        x=x+self.drop(out)
         weights=None
         if self.cross is not None:
-            out,weights=self.cross(x,context,context,key_padding_mask=context_pad,
-                need_weights=attention,average_attn_weights=False)
-            x=self.n3(x+self.drop(out))
-        return self.n2(x+self.ff(x)),weights
+            out,weights=self.cross(self.n3(x),context,context_pad,attention=attention)
+            x=x+self.drop(out)
+        return x+self.ff(self.n2(x)),weights
 
 class Model(nn.Module):
     def __init__(self,c=Config()):
         super().__init__()
-        if c.d_model%c.heads or c.d_model%2:
-            raise ValueError("d_model must be even and divisible by heads")
+        if c.architecture_version!=3 or c.d_model%(2*c.heads):
+            raise ValueError("Expected v3 architecture and even head dimension")
         self.config=c
         self.aa_embed=nn.Embedding(len(AA),c.d_model,padding_idx=PAD)
         self.codon_embed=nn.Embedding(len(CODONS),c.d_model,padding_idx=PAD)
         self.encoder=nn.ModuleList(Block(c) for _ in range(c.layers))
         self.decoder=nn.ModuleList(Block(c,True) for _ in range(c.layers))
         self.output=nn.Linear(c.d_model,len(CODONS))
+        self.enc_norm=nn.RMSNorm(c.d_model,eps=1e-6)
+        self.dec_norm=nn.RMSNorm(c.d_model,eps=1e-6)
+        self.align=nn.Linear(c.d_model,c.d_model,bias=False)
+        self.align_gate=nn.Parameter(torch.tensor(-1.))
         self.drop=nn.Dropout(c.dropout)
-        pos=torch.arange(c.max_length+2).float()[:,None]
-        freq=torch.exp(-math.log(10000)*torch.arange(c.d_model//2).float()/(c.d_model//2))
-        angle=pos*freq
-        self.register_buffer("pos",torch.cat([angle.sin(),angle.cos()],-1))
+        for emb in (self.aa_embed,self.codon_embed):
+            nn.init.normal_(emb.weight,std=c.d_model**-.5)
+            with torch.no_grad(): emb.weight[PAD].zero_()
         self.register_buffer("allowed",ALLOWED.clone())
     def embed(self,ids,layer):
         return layer(ids)*math.sqrt(self.config.d_model)
     def with_pos(self,x):
-        if x.shape[1]>len(self.pos):
+        if x.shape[1]>self.config.max_length+2:
             raise ValueError("Sequence exceeds configured context length")
-        return self.drop(x+self.pos[:x.shape[1]].to(x.dtype))
+        return self.drop(x)
     def encode(self,aa,emb=None):
         x=self.with_pos(self.embed(aa,self.aa_embed) if emb is None else emb)
         for block in self.encoder:
             x,_=block(x,aa.eq(PAD))
-        return x
+        return self.enc_norm(x)
     def decode(self,aa,prefix,context,emb=None,attention=False):
         x=self.with_pos(self.embed(prefix,self.codon_embed) if emb is None else emb)
-        causal=torch.ones(prefix.shape[1],prefix.shape[1],dtype=torch.bool,device=prefix.device).triu(1)
+        # Shift by one: BOS predicts the first amino acid, not BOS itself.
+        aligned=context[:,1:prefix.shape[1]+1]
+        x=x+self.align_gate.sigmoid()*self.align(aligned)
         weights=[]
         for block in self.decoder:
-            x,w=block(x,prefix.eq(PAD),context,aa.eq(PAD),causal,attention)
+            x,w=block(x,prefix.eq(PAD),context,aa.eq(PAD),True,attention)
             if attention: weights.append(w)
-        logits=self.output(x)
+        logits=self.output(self.dec_norm(x))
         if self.config.synonym_mask:
             target=aa[:,1:prefix.shape[1]+1]
             logits=logits.masked_fill(~self.allowed[target],float("-inf"))
@@ -154,6 +216,8 @@ def load_model(path,device="cpu"):
     ckpt=torch.load(path,map_location=device,weights_only=True)
     if ckpt["aa_vocab"]!=AA or ckpt["codon_vocab"]!=CODONS:
         raise ValueError("Checkpoint vocabulary mismatch")
+    if ckpt["config"].get("architecture_version")!=3:
+        raise ValueError("Earlier architecture checkpoint; retrain with v3.")
     m=Model(Config(**ckpt["config"])).to(device)
     m.load_state_dict(ckpt["state"])
     return m.eval(),ckpt["metadata"]
