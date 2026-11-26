@@ -81,7 +81,7 @@ def collect(model,dl,device):
         xs.append(logits[keep].float().cpu()); ys.append(y[keep].cpu())
     return torch.cat(xs),torch.cat(ys)
 
-def run(paths,out,config,ensemble=5,batch=32,epochs=40,lr=3e-4,groups=None):
+def run(paths,out,config,ensemble=5,batch=32,epochs=40,lr=3e-4,groups=None,weight_decay=.01):
     out=Path(out); out.mkdir(parents=True,exist_ok=True)
     device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
     train,val,cal,test=split(records(paths,config.max_length),groups=groups)
@@ -91,7 +91,7 @@ def run(paths,out,config,ensemble=5,batch=32,epochs=40,lr=3e-4,groups=None):
     for seed in range(ensemble):
         torch.manual_seed(1000+seed)
         m=Model(config).to(device)
-        opt=torch.optim.AdamW(m.parameters(),lr=lr,weight_decay=.01)
+        opt=torch.optim.AdamW(m.parameters(),lr=lr,weight_decay=weight_decay)
         dl=loader(train,batch,True,1000+seed)
         steps=len(dl)*epochs
         warm=max(1,int(.05*steps))
@@ -132,5 +132,11 @@ if __name__=="__main__":
     p.add_argument("--batch",type=int,default=32)
     p.add_argument("--activation",choices=["relu","xielu","swiglu"],default="xielu")
     p.add_argument("--max-length",type=int,default=1024)
+    p.add_argument("--tuned-config",type=str,default=None)
     a=p.parse_args()
-    run(a.fasta,a.out,Config(activation=a.activation,max_length=a.max_length),a.ensemble,a.batch,a.epochs)
+    if a.tuned_config:
+        t=json.loads(Path(a.tuned_config).read_text())
+        run(a.fasta,a.out,Config(**t["config"]),a.ensemble,t["batch"],a.epochs,
+            lr=t["lr"],weight_decay=t["weight_decay"])
+    else:
+        run(a.fasta,a.out,Config(activation=a.activation,max_length=a.max_length),a.ensemble,a.batch,a.epochs)
