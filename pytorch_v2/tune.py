@@ -8,7 +8,7 @@ from pathlib import Path
 import torch
 from torch.nn import functional as F
 from model import Config, Model, ALLOWED, PAD, EOS
-from train import records, split, loader, epoch
+from train import records, split, loader, epoch, make_optimizer, make_scaler
 
 BASELINE = dict(d_model=256, d_ff=1024, dropout=.05, lr=3e-4, weight_decay=.01)
 # Start with LR to avoid comparing architectures at an obviously poor LR.
@@ -51,7 +51,7 @@ def signature(paths,batch,max_length,epochs,seed,prune,groups):
             for chunk in iter(lambda:f.read(1024*1024),b""): h.update(chunk)
         files.append([str(p),h.hexdigest()])
     group_hash=None if groups is None else hashlib.sha256(json.dumps(groups,sort_keys=True).encode()).hexdigest()
-    return dict(version=1,files=files,batch=batch,max_length=max_length,epochs=epochs,
+    return dict(version=3,files=files,batch=batch,max_length=max_length,epochs=epochs,
                 seed=seed,prune=prune,groups=group_hash,space=SPACE,baseline=BASELINE)
 
 def tune(paths,out,batch=16,max_length=1024,epochs=8,seed=2026,prune=True,groups=None):
@@ -70,6 +70,7 @@ def tune(paths,out,batch=16,max_length=1024,epochs=8,seed=2026,prune=True,groups
     tr,va,_,_=split(records(paths,max_length),groups=groups)
     device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
     val_dl=loader(va,batch)
+    if device.type=="cuda": torch.set_float32_matmul_precision("high")
     cache={json.dumps(r["params"],sort_keys=True):r for r in state["trials"]}
 
     def evaluate(params,incumbent=None):
@@ -78,14 +79,15 @@ def tune(paths,out,batch=16,max_length=1024,epochs=8,seed=2026,prune=True,groups
         torch.manual_seed(seed)
         m=Model(model_config(params,max_length)).to(device)
         dl=loader(tr,batch,True,seed)
-        opt=torch.optim.AdamW(m.parameters(),lr=params["lr"],weight_decay=params["weight_decay"])
+        opt=make_optimizer(m,params["lr"],params["weight_decay"])
+        scaler=make_scaler(device)
         steps=len(dl)*epochs; warm=max(1,int(.05*steps))
         def schedule(s):
             return min(1.,(s+1)/warm) if s<warm else .1+.9*(1+math.cos(math.pi*min(1.,(s-warm)/max(1,steps-warm))))/2
         sched=torch.optim.lr_scheduler.LambdaLR(opt,schedule)
         curve=[]; status="complete"; start=time.perf_counter()
         for e in range(epochs):
-            epoch(m,dl,device,opt,sched)
+            epoch(m,dl,device,opt,sched,scaler)
             nll=synonymous_nll(m,val_dl,device)
             if not math.isfinite(nll):
                 status="nonfinite"; break
