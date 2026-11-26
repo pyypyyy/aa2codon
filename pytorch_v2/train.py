@@ -118,7 +118,10 @@ def epoch(model,dl,device,opt=None,scheduler=None,scaler=None,monitor=None,epoch
                 scaler.unscale_(opt)
                 norm=float(torch.nn.utils.clip_grad_norm_(model.parameters(),1.))
                 if math.isfinite(norm): grad_sum+=norm; grad_steps+=1
-                else: skipped+=1
+                else:
+                    skipped+=1
+                    if not scaler.is_enabled():
+                        raise RuntimeError('Non-finite gradients in unscaled training')
                 old_scale=scaler.get_scale()
                 scaler.step(opt)
                 scaler.update()
@@ -163,7 +166,7 @@ def run(paths,out,config,ensemble=5,batch=32,epochs=40,lr=3e-4,groups=None,weigh
     manifest=[]
     test_sum=None
     val_sum=None
-    from training_monitor import TrainingMonitor, diagnostics
+    from training_monitor import TrainingMonitor, diagnostics, gpu_utilization
     monitor=TrainingMonitor(out,ensemble,epochs,live=live)
     val_dl=loader(val,batch)
     cal_dl=loader(cal,batch)
@@ -206,6 +209,8 @@ def run(paths,out,config,ensemble=5,batch=32,epochs=40,lr=3e-4,groups=None,weigh
                         gpu_reserved_gib=torch.cuda.memory_reserved(device)/gib,
                         gpu_peak_gib=torch.cuda.max_memory_allocated(device)/gib,
                         gpu_total_gib=torch.cuda.get_device_properties(device).total_memory/gib)
+                    util=gpu_utilization(device)
+                    if util is not None: row['gpu_utilization_pct']=util
                 history.append(row)
                 monitor.record(row)
                 if stale>=5: break
@@ -217,7 +222,6 @@ def run(paths,out,config,ensemble=5,batch=32,epochs=40,lr=3e-4,groups=None,weigh
             vp=(xv/temperature).softmax(-1)
             val_sum=vp.clone() if val_sum is None else val_sum.add_(vp)
             v_report=reliability(val_sum/(seed+1),yv)
-            monitor.member_done({k:v_report[k] for k in ('nll','ece','brier')})
             del xv,yv,vp
             xt,yt=collect(m,test_dl,device)
             probs=(xt/temperature).softmax(-1)
@@ -226,6 +230,7 @@ def run(paths,out,config,ensemble=5,batch=32,epochs=40,lr=3e-4,groups=None,weigh
             manifest.append(dict(path=path.name,temperature=temperature,
                  test=reliability(probs,yt),history=history))
             (out/"manifest.json").write_text(json.dumps(manifest,indent=2))
+            monitor.member_done({k:v_report[k] for k in ("nll","ece","brier")})
         report=reliability(test_sum/len(manifest),yt)
         (out/"ensemble_test.json").write_text(json.dumps(report,indent=2))
         return manifest,report
