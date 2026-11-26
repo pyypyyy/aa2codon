@@ -1,12 +1,12 @@
 """Training, split preparation and checkpoint calibration."""
-import argparse, json, random
+import argparse, json, random, time, math
 from pathlib import Path
 import torch
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, Sampler
 from torch.nn.utils.rnn import pad_sequence
 from Bio import SeqIO
-from model import Model, Config, encode_cds, PAD, EOS, ALLOWED
+from model import Model, Config, encode_cds, PAD, EOS, ALLOWED, AA
 from uncertainty import fit_temperature, reliability
 
 def records(paths,max_length):
@@ -83,21 +83,28 @@ def make_optimizer(model,lr,weight_decay):
 def make_scaler(device):
     return torch.amp.GradScaler("cuda",enabled=device.type=="cuda" and not torch.cuda.is_bf16_supported())
 
-def epoch(model,dl,device,opt=None,scheduler=None,scaler=None):
+def epoch(model,dl,device,opt=None,scheduler=None,scaler=None,monitor=None,epoch_number=1,aa_breakdown=False):
     training=opt is not None
     model.train(training)
     if training and scaler is None: scaler=make_scaler(device)
     amp=device.type=="cuda"
     dtype=torch.bfloat16 if amp and torch.cuda.is_bf16_supported() else torch.float16
-    total=0.; count=0; correct=0
-    for a,p,y in dl:
+    total=0.; count=0; correct=0; grad_sum=0.; grad_steps=0; skipped=0
+    started=time.perf_counter()
+    if aa_breakdown:
+        aa_sums=torch.zeros(len(AA),device=device)
+        aa_counts=torch.zeros(len(AA),device=device)
+    if monitor: monitor.start_epoch(epoch_number,len(dl),'Training' if training else 'Validation')
+    for batch_idx,(a,p,y) in enumerate(dl,1):
         a,p,y=[v.to(device,non_blocking=True) for v in (a,p,y)]
         if model.config.synonym_mask:
             keep=(model.allowed[a[:,1:]].sum(-1)>1)&y.ne(PAD)&y.ne(EOS)
         else:
             keep=y.ne(PAD)
         n=int(keep.sum())
-        if not n: continue
+        if not n:
+            if monitor: monitor.batch(batch_idx,len(dl),total/max(count,1),correct/max(count,1))
+            continue
         if training: opt.zero_grad(set_to_none=True)
         with torch.set_grad_enabled(training):
             with torch.autocast(device_type=device.type,dtype=dtype,enabled=amp):
@@ -109,15 +116,31 @@ def epoch(model,dl,device,opt=None,scheduler=None,scaler=None):
             if training:
                 scaler.scale(loss/n).backward()
                 scaler.unscale_(opt)
-                torch.nn.utils.clip_grad_norm_(model.parameters(),1.)
+                norm=float(torch.nn.utils.clip_grad_norm_(model.parameters(),1.))
+                if math.isfinite(norm): grad_sum+=norm; grad_steps+=1
+                else: skipped+=1
                 old_scale=scaler.get_scale()
                 scaler.step(opt)
                 scaler.update()
                 if scheduler and scaler.get_scale()>=old_scale: scheduler.step()
         total+=float(loss.detach()); count+=n
         correct+=int((logits.argmax(-1).eq(y)&keep).sum())
+        if aa_breakdown:
+            with torch.no_grad():
+                ids=a[:,1:][keep]
+                losses=F.cross_entropy(logits[keep].float(),y[keep],reduction='none')
+                aa_sums.scatter_add_(0,ids,losses)
+                aa_counts.scatter_add_(0,ids,torch.ones_like(losses))
+        if monitor: monitor.batch(batch_idx,len(dl),total/count,correct/count,opt.param_groups[0]['lr'] if training else None)
+    if monitor: monitor.close_bar()
     if not count: raise ValueError("No informative codon positions")
-    return dict(loss=total/count,accuracy=correct/count)
+    seconds=max(time.perf_counter()-started,1e-9)
+    result=dict(loss=total/count,accuracy=correct/count,tokens_per_second=count/seconds,seconds=seconds)
+    if training: result.update(grad_norm=grad_sum/max(grad_steps,1),nonfinite_grad_batches=skipped)
+    if aa_breakdown:
+        sums,counts=aa_sums.cpu().tolist(),aa_counts.cpu().tolist()
+        result['aa_nll']={AA[i]:sums[i]/n for i,n in enumerate(counts) if n}
+    return result
 
 @torch.no_grad()
 def collect(model,dl,device):
@@ -132,55 +155,82 @@ def collect(model,dl,device):
         xs.append(logits[keep].float().cpu()); ys.append(y[keep].cpu())
     return torch.cat(xs),torch.cat(ys)
 
-def run(paths,out,config,ensemble=5,batch=32,epochs=40,lr=3e-4,groups=None,weight_decay=.01):
+def run(paths,out,config,ensemble=5,batch=32,epochs=40,lr=3e-4,groups=None,weight_decay=.01,live=False):
     out=Path(out); out.mkdir(parents=True,exist_ok=True)
     device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
     train,val,cal,test=split(records(paths,config.max_length),groups=groups)
     print("Device:",device,"split sizes:",*[len(x) for x in (train,val,cal,test)])
     manifest=[]
     test_sum=None
+    val_sum=None
+    from training_monitor import TrainingMonitor, diagnostics
+    monitor=TrainingMonitor(out,ensemble,epochs,live=live)
     val_dl=loader(val,batch)
     cal_dl=loader(cal,batch)
     test_dl=loader(test,batch)
     if device.type=="cuda": torch.set_float32_matmul_precision("high")
-    for seed in range(ensemble):
-        torch.manual_seed(1000+seed)
-        m=Model(config).to(device)
-        opt=make_optimizer(m,lr,weight_decay)
-        scaler=make_scaler(device)
-        dl=loader(train,batch,True,1000+seed)
-        steps=len(dl)*epochs
-        warm=max(1,int(.05*steps))
-        import math
-        def schedule(s):
-            return min(1.,(s+1)/warm) if s<warm else .1+.9*(1+math.cos(math.pi*min(1.,(s-warm)/max(1,steps-warm))))/2
-        sched=torch.optim.lr_scheduler.LambdaLR(opt,schedule)
-        best=float("inf"); stale=0; history=[]
-        path=out/f"member_{seed}.pt"
-        for e in range(epochs):
-            tr=epoch(m,dl,device,opt,sched,scaler)
-            va=epoch(m,val_dl,device)
-            row=dict(epoch=e+1,train=tr,validation=va,activation=m.activation_parameters())
-            history.append(row); print(seed,row)
-            if va["loss"]<best:
-                best=va["loss"]; stale=0; m.save(path,seed=seed)
-            else:
-                stale+=1
+    try:
+        for seed in range(ensemble):
+            monitor.start_member(seed+1)
+            torch.manual_seed(1000+seed)
+            m=Model(config).to(device)
+            opt=make_optimizer(m,lr,weight_decay)
+            scaler=make_scaler(device)
+            dl=loader(train,batch,True,1000+seed)
+            steps=len(dl)*epochs
+            warm=max(1,int(.05*steps))
+            import math
+            def schedule(s):
+                return min(1.,(s+1)/warm) if s<warm else .1+.9*(1+math.cos(math.pi*min(1.,(s-warm)/max(1,steps-warm))))/2
+            sched=torch.optim.lr_scheduler.LambdaLR(opt,schedule)
+            best=float("inf"); stale=0; history=[]
+            path=out/f"member_{seed}.pt"
+            for e in range(epochs):
+                started=time.perf_counter()
+                if device.type=='cuda': torch.cuda.reset_peak_memory_stats(device)
+                tr=epoch(m,dl,device,opt,sched,scaler,monitor,e+1)
+                va=epoch(m,val_dl,device,monitor=monitor,epoch_number=e+1,aa_breakdown=True)
+                gates,magnitudes=diagnostics(m,val_dl,device)
+                if not math.isfinite(va['loss']) or not math.isfinite(tr['loss']):
+                    raise RuntimeError('Non-finite training or validation loss; inspect logs.')
+                if va["loss"]<best:
+                    best=va["loss"]; stale=0; m.save(path,seed=seed)
+                else:
+                    stale+=1
+                row=dict(epoch=e+1,train=tr,validation=va,activation=m.activation_parameters(),
+                    attention_gates=gates,activation_rms=magnitudes,validation_aa_nll=va['aa_nll'],
+                    lr=opt.param_groups[0]['lr'],best_val=best,stale=stale,seconds=time.perf_counter()-started)
+                if device.type=='cuda':
+                    gib=1024**3
+                    row.update(gpu_allocated_gib=torch.cuda.memory_allocated(device)/gib,
+                        gpu_reserved_gib=torch.cuda.memory_reserved(device)/gib,
+                        gpu_peak_gib=torch.cuda.max_memory_allocated(device)/gib,
+                        gpu_total_gib=torch.cuda.get_device_properties(device).total_memory/gib)
+                history.append(row)
+                monitor.record(row)
                 if stale>=5: break
-        from model import load_model
-        m,_=load_model(path,device)
-        x,y=collect(m,cal_dl,device)
-        temperature=fit_temperature(x,y)
-        xt,yt=collect(m,test_dl,device)
-        probs=(xt/temperature).softmax(-1)
-        test_sum=probs.clone() if test_sum is None else test_sum.add_(probs)
-        m.save(path,seed=seed,temperature=temperature)
-        manifest.append(dict(path=path.name,temperature=temperature,
-             test=reliability(probs,yt),history=history))
-        (out/"manifest.json").write_text(json.dumps(manifest,indent=2))
-    report=reliability(test_sum/len(manifest),yt)
-    (out/"ensemble_test.json").write_text(json.dumps(report,indent=2))
-    return manifest,report
+            from model import load_model
+            m,_=load_model(path,device)
+            x,y=collect(m,cal_dl,device)
+            temperature=fit_temperature(x,y)
+            xv,yv=collect(m,val_dl,device)
+            vp=(xv/temperature).softmax(-1)
+            val_sum=vp.clone() if val_sum is None else val_sum.add_(vp)
+            v_report=reliability(val_sum/(seed+1),yv)
+            monitor.member_done({k:v_report[k] for k in ('nll','ece','brier')})
+            del xv,yv,vp
+            xt,yt=collect(m,test_dl,device)
+            probs=(xt/temperature).softmax(-1)
+            test_sum=probs.clone() if test_sum is None else test_sum.add_(probs)
+            m.save(path,seed=seed,temperature=temperature)
+            manifest.append(dict(path=path.name,temperature=temperature,
+                 test=reliability(probs,yt),history=history))
+            (out/"manifest.json").write_text(json.dumps(manifest,indent=2))
+        report=reliability(test_sum/len(manifest),yt)
+        (out/"ensemble_test.json").write_text(json.dumps(report,indent=2))
+        return manifest,report
+    finally:
+        monitor.close()
 
 if __name__=="__main__":
     p=argparse.ArgumentParser()
