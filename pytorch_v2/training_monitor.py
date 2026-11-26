@@ -2,12 +2,14 @@
 import json
 import csv
 import time
+import subprocess
+import uuid
 from pathlib import Path
 import torch
 
 class TrainingMonitor:
     def __init__(self,out,total,epochs,live=False):
-        self.out=Path(out)/"training_logs"/time.strftime("%Y%m%d-%H%M%S")
+        self.out=Path(out)/"training_logs"/(time.strftime("%Y%m%d-%H%M%S")+"-"+uuid.uuid4().hex[:6])
         self.out.mkdir(parents=True,exist_ok=False)
         self.total,self.epochs,self.live=total,epochs,live
         self.writer=None; self.display=None; self.bar=None
@@ -54,8 +56,8 @@ class TrainingMonitor:
             for key,val in row[phase].items():
                 if isinstance(val,(float,int)):
                     flat[f"{phase}_{key}"]=val
-        for key in ("gpu_allocated_gib","gpu_reserved_gib","gpu_total_gib"):
-            flat[key]=row.get(key,0)
+        for key in ("gpu_allocated_gib","gpu_reserved_gib","gpu_peak_gib","gpu_total_gib","gpu_utilization_pct"):
+            flat[key]=row.get(key,-1)
         file=self.out/"epochs.csv"
         with file.open("a",newline="") as f:
             w=csv.DictWriter(f,fieldnames=list(flat))
@@ -72,6 +74,8 @@ class TrainingMonitor:
             for name,values in row.get("attention_gates",{}).items():
                 for h,v in enumerate(values):
                     self.writer.add_scalar(f"{prefix}/gates/{name}/head_{h+1}",v,row["epoch"])
+            for name,rms in row.get("activation_rms",{}).items():
+                self.writer.add_scalar(f"{prefix}/activation_rms/{name}",rms,row["epoch"])
             for aa,nll in row.get("validation_aa_nll",{}).items():
                 self.writer.add_scalar(f"{prefix}/aa_nll/{aa}",nll,row["epoch"])
             self.writer.flush()
@@ -96,9 +100,11 @@ class TrainingMonitor:
         rows=self.history
         if not rows: return
         x=[r["epoch"] for r in rows]; last=rows[-1]
-        fig=make_subplots(rows=3,cols=2,subplot_titles=(
+        fig=make_subplots(rows=5,cols=2,subplot_titles=(
             "Synonymous codon NLL","Synonymous codon accuracy","Learning rate",
-            "Gradient norm (before clipping)","xIELU coefficients","Ensemble validation NLL"))
+            "Gradient norm (before clipping)","xIELU coefficients","Ensemble validation NLL",
+            "Attention head gates (validation sample)","Activation RMS (validation sample)",
+            "Validation NLL by residue","Informative codons per second"))
         def line(xx,yy,name,r,c,dash=None):
             fig.add_trace(go.Scatter(x=xx,y=yy,name=name,mode="lines+markers",
                 line=dict(dash=dash or "solid"),marker=dict(size=4)),row=r,col=c)
@@ -113,10 +119,22 @@ class TrainingMonitor:
         if self.completed:
             line([r["member"] for r in self.completed],[r["nll"] for r in self.completed],
                  "Cumulative ensemble",3,2)
+        for name,values in last.get("attention_gates",{}).items():
+            for h in range(len(values)):
+                line(x,[r["attention_gates"][name][h] for r in rows],f"{name} h{h+1}",4,1)
+        for name in last.get("activation_rms",{}):
+            line(x,[r["activation_rms"][name] for r in rows],name,4,2)
+        for aa in last.get("validation_aa_nll",{}):
+            line(x,[r["validation_aa_nll"].get(aa) for r in rows],aa,5,1)
+        line(x,[r["train"]["tokens_per_second"] for r in rows],"Throughput",5,2)
+        fig.update_yaxes(range=[0,1],row=4,col=1)
         fig.update_yaxes(tickformat=".0%",row=1,col=2)
-        fig.update_layout(height=720,margin=dict(t=40,b=25,l=35,r=15),legend=dict(font=dict(size=9)))
+        fig.update_layout(height=1150,margin=dict(t=40,b=25,l=35,r=15),legend=dict(font=dict(size=9)))
         gpu=(f"{last['gpu_allocated_gib']:.2f} GiB allocated / {last['gpu_total_gib']:.2f} GiB total"
              if last.get("gpu_total_gib",0) else "CPU")
+        if last.get("gpu_utilization_pct") is not None:
+            gpu+=f" | sampled utilization {last['gpu_utilization_pct']:.0f}%"
+        if last.get("gpu_peak_gib",0): gpu+=f" | peak {last['gpu_peak_gib']:.2f} GiB"
         done=len(self.completed)
         # Progress is a completed-member count, not a time estimate.
         header=(f"<h3>aa2codon training | member {self.member}/{self.total} | "
@@ -128,7 +146,7 @@ class TrainingMonitor:
                 f"Epoch: {last['seconds']:.1f} s | "
                 f"Informative codons/s: {last['train']['tokens_per_second']:,.0f}<br>"
                 f"Memory: {gpu} | Elapsed: {(time.perf_counter()-self.started)/60:.1f} min</p>")
-        html=HTML(header+fig.to_html(full_html=False,include_plotlyjs=True))
+        html=HTML(header+fig.to_html(full_html=False,include_plotlyjs="cdn"))
         if self.display is None: self.display=display(html,display_id=True)
         else: self.display.update(html)
 
@@ -171,3 +189,15 @@ def diagnostics(model,dl,device,max_batches=4):
         for h in hooks: h.remove()
     return ({k:(v/counts[k]).cpu().tolist() for k,v in sums.items()},
             {k:v/max(n,1) for k,v in magnitudes.items()})
+
+def gpu_utilization(device):
+    """Instantaneous utilization sample, not average during training.
+    Colab normally exposes one GPU. Do not guess on multi-GPU systems.
+    """
+    if device.type!="cuda": return None
+    try:
+        lines=subprocess.check_output(["nvidia-smi","--query-gpu=utilization.gpu",
+            "--format=csv,noheader,nounits"],text=True,timeout=2).strip().splitlines()
+        return float(lines[0]) if len(lines)==1 else None
+    except (OSError,ValueError,subprocess.SubprocessError):
+        return None
