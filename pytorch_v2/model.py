@@ -120,6 +120,7 @@ class Attention(nn.Module):
         q=self.rope(self.qnorm(self.heads_view(self.q(x))),int(self.cross))
         k=self.rope(self.knorm(self.heads_view(self.k(context))))
         v=self.heads_view(self.v(context))
+        q,k=q.to(v.dtype),k.to(v.dtype)
         # SDPA bool masks use True for allowed keys, unlike MultiheadAttention.
         mask=~pad[:,None,None,:]
         if causal:
