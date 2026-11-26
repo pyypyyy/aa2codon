@@ -15,3 +15,11 @@ Uncertainty is conditional on a common ensemble-selected prefix; it does not qua
 Integrated gradients compare chosen and alternative synonymous codon logits with a zero embedding baseline, and include encoder and decoder-prefix contributions. Attribution is not a causal biological explanation. Attention maps are retained. In silico mutagenesis intentionally omitted.
 
 This is an initial implementation; run smoke tests and Colab validation before relying on results. Full training and GPU benchmarks are not included.
+
+
+## Focused tuning
+
+Open [Tune in Colab](https://colab.research.google.com/github/pyypyyy/aa2codon/blob/pytorch-xielu-uncertainty/pytorch_v2/Tune.ipynb) before Train. The search starts with 3 layers on each side, 8 heads, d_model=256, d_ff=1024, dropout=.05, LR=.0003 and AdamW weight decay=.01. It varies five settings (LR, model width, FFN width, dropout, weight decay) with five values each, one coordinate at a time: at most 21 unique trials rather than 3125 combinations. Each trial uses the same fixed data split, seed, batch size and eight-epoch default budget. Optional midpoint pruning discards trials with NLL more than 15% above the current incumbent at the same epoch. The objective is teacher-forced validation NLL on degenerate codons. Calibration/test partitions are not used in tuning. This is a local, short-budget search, not proof of globally optimal parameters.
+
+The notebook persists completed trials and best_config.json to Google Drive. Interrupted trials restart from the beginning. Keep the same FASTA files (including ordering), context length, batch size and data split when moving to Train; the notebook checks the tuning signature. The default ensemble size in Train is ten. The training loop does not yet support mid-training checkpoint/resume or adaptive ensemble expansion. A larger model can exceed GPU memory; lower batch size and restart tuning in a separate directory if needed. No tuning runs or Colab execution have been performed as part of this change.
+
